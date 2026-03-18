@@ -487,6 +487,78 @@ def f_internal_tube(Re):
     w = (Re_eff - 2300.0)/(4000.0 - 2300.0)
     return (1.0 - w)*f_lam + w*f_turb, 'transitional blend'
 
+def compressible_gas_tube_march(props_func, T_in_C: float, T_out_C: float, P_in_abs_Pa: float,
+                                 m_dot_per_tube: float, A_flow_one: float, Dh_i: float, L_tube: float,
+                                 internal_area_ratio: float = 1.0, internal_h_enhancement: float = 1.0,
+                                 internal_dp_multiplier: float = 1.0, n_segments: int = 24) -> Dict[str, float]:
+    """Segmented compressible-gas march along one tube.
+    Uses local T/P-dependent density and viscosity, Darcy friction, and a simple acceleration term.
+    This is still a 1D engineering model, but it avoids the incompressible shortcut for CAC service.
+    """
+    n_segments = max(int(n_segments), 4)
+    dx = max(L_tube, 1e-12) / n_segments
+    P = max(P_in_abs_Pa, 2_000.0)
+    G = m_dot_per_tube / max(A_flow_one, 1e-12)
+
+    sum_rho = sum_cp = sum_k = sum_mu = 0.0
+    sum_Re = sum_Nu = sum_h = sum_v = sum_f = 0.0
+    last_regime = 'n/a'
+
+    for s in range(n_segments):
+        x0 = s / n_segments
+        x1 = (s + 1) / n_segments
+        T0 = T_in_C + (T_out_C - T_in_C) * x0
+        T1 = T_in_C + (T_out_C - T_in_C) * x1
+        Tm = 0.5 * (T0 + T1)
+
+        props = props_func(Tm, P)
+        rho = max(float(props['rho']), 1e-9)
+        cp = max(float(props['cp']), 1e-9)
+        k = max(float(props['k']), 1e-12)
+        mu = max(float(props['mu']), 1e-12)
+        Pr = max(float(props['Pr']), 1e-12)
+
+        v = m_dot_per_tube / max(rho * A_flow_one, 1e-12)
+        Re = reynolds(rho, v, Dh_i, mu)
+        Nu, regime = nu_internal_tube(Re, Pr, Dh_i, max(L_tube, 1e-12))
+        h = (Nu * k / max(Dh_i, 1e-12)) * internal_area_ratio * internal_h_enhancement
+        fDarcy, _ = f_internal_tube(Re)
+
+        dP_f = fDarcy * (dx / max(Dh_i, 1e-12)) * 0.5 * rho * (v ** 2) * internal_dp_multiplier
+        P_after_f = max(P - dP_f, 1_000.0)
+        props_out = props_func(T1, P_after_f)
+        rho_out = max(float(props_out['rho']), 1e-9)
+        dP_acc = max((G ** 2) * (1.0 / rho_out - 1.0 / rho), 0.0)
+        dP_seg = dP_f + dP_acc
+        P = max(P - dP_seg, 1_000.0)
+
+        sum_rho += rho
+        sum_cp += cp
+        sum_k += k
+        sum_mu += mu
+        sum_Re += Re
+        sum_Nu += Nu
+        sum_h += h
+        sum_v += v
+        sum_f += fDarcy
+        last_regime = regime
+
+    denom = float(n_segments)
+    return {
+        'dp_total_Pa': max(P_in_abs_Pa - P, 0.0),
+        'P_out_abs_Pa': P,
+        'rho_mean': sum_rho / denom,
+        'cp_mean': sum_cp / denom,
+        'k_mean': sum_k / denom,
+        'mu_mean': sum_mu / denom,
+        'Re_mean': sum_Re / denom,
+        'Nu_mean': sum_Nu / denom,
+        'h_mean': sum_h / denom,
+        'v_mean': sum_v / denom,
+        'f_mean': sum_f / denom,
+        'regime': last_regime,
+    }
+
 def colburn_j_corrugated(Re, fin_pitch, Dh_air, pitch_l, pitch_w, louver_pitch=0.0, louver_angle_deg=0.0,
                          Cj=0.12, mj=0.30, aj=0.05, bj=0.03, cj=0.08):
     theta = math.radians(max(louver_angle_deg, 0.0))
@@ -853,11 +925,14 @@ k_tube = material_k(tube_material)
 k_fin = material_k(fin_material)
 oil_inputs = {'model': 'grade_library' if (tube_side_service == 'Oil' and oil_use_grade_library) else 'manual', 'family': oil_family, 'grade': oil_grade, 'rho15': oil_density_kg_m3, 'nu40': oil_nu40_cSt, 'nu100': oil_nu100_cSt, 'rho': oil_density_kg_m3, 'cp': oil_cp_J_kgK, 'k': oil_k_W_mK, 'mu_mPas': oil_mu_mPas}
 
-def tube_props_at(T_C: float):
-    return get_tube_side_props(tube_side_service, T_C, coolant_pressure_abs_kPa*1000.0,
+def tube_props_at_pressure(T_C: float, P_abs_Pa: float):
+    return get_tube_side_props(tube_side_service, T_C, max(P_abs_Pa, 2000.0),
                                coolant_name=coolant_name, glycol_pct=glycol_pct, oil_inputs=oil_inputs)
 
-tube_props_inlet = tube_props_at(T_cool_in_C)
+def tube_props_at(T_C: float):
+    return tube_props_at_pressure(T_C, coolant_pressure_abs_kPa*1000.0)
+
+tube_props_inlet = tube_props_at_pressure(T_cool_in_C, coolant_pressure_abs_kPa*1000.0)
 rho_tube_inlet = tube_props_inlet['rho']
 if tube_side_service == 'Charge air / CAC':
     m_dot_cool = float(charge_air_mdot_kg_s)
@@ -910,6 +985,8 @@ internal_area_ratio_geom = float(internal_model['internal_area_ratio_geom'])
 internal_area_ratio = float(internal_model['internal_area_ratio_equiv'])
 internal_insert_type_resolved = str(internal_model['insert_type_resolved'])
 internal_wetted_area_credit_factor = float(internal_model['wetted_area_credit_factor'])
+has_internal_insert_effective = bool(has_internal_fins and internal_insert_type_resolved not in ['None', 'No', ''] and internal_fin_count_per_tube > 0)
+internal_insert_present_display = 'Yes' if has_internal_insert_effective else 'No'
 
 Dh_i = 4.0*Ai_flow_one/max(Pi_heat_one, 1e-12)
 A_i_heat_one = Pi_heat_one*L_tube
@@ -1043,6 +1120,7 @@ Q_total_W = 0.0
 dp_air_total_Pa = 0.0
 dp_cool_total_Pa = 0.0
 T_cool_pass_in = T_cool_in_C
+P_tube_pass_in_abs_Pa = coolant_pressure_abs_kPa*1000.0
 T_air_out_overall_last_C = air_in_C
 
 for i, p in enumerate(pass_area_rows, start=1):
@@ -1053,8 +1131,8 @@ for i, p in enumerate(pass_area_rows, start=1):
     N_parallel = max(p['tubes_in_pass_total'], 1)
     rows_in_pass = max(int(n_rows), 1)
 
-    # Coolant in-tube / pass hydraulics based on pass inlet condition
-    cpkg_in = tube_props_at(T_cool_pass_in)
+    # Tube-side hydraulics starting point for this pass
+    cpkg_in = tube_props_at_pressure(T_cool_pass_in, P_tube_pass_in_abs_Pa)
     rho_c = cpkg_in['rho']; mu_c = cpkg_in['mu']; k_c = cpkg_in['k']; Pr_c = cpkg_in['Pr']; cp_c = cpkg_in['cp']
     m_dot_per_tube = m_dot_cool/N_parallel
     v_i = m_dot_per_tube/max(rho_c*Ai_flow_one, 1e-12)
@@ -1065,7 +1143,6 @@ for i, p in enumerate(pass_area_rows, start=1):
 
     f_i, friction_regime = f_internal_tube(Re_i)
     dp_cool_pass = f_i*(L_tube/max(Dh_i,1e-12))*0.5*rho_c*(v_i**2)*internal_dp_multiplier
-    dp_cool_total_Pa += dp_cool_pass
 
     # Areas split row-by-row for actual marching
     A_tube_row = p['A_tube_ext_pass_m2']/rows_in_pass
@@ -1074,6 +1151,7 @@ for i, p in enumerate(pass_area_rows, start=1):
     # Non-row model keeps the previous bulk-pass behavior
     if not row_model:
         T_air_pass_in = air_in_C
+        P_pass_in_abs = P_tube_pass_in_abs_Pa
         ap = air_properties(T_air_pass_in, RH_frac)
 
         if air_htc_model == 'Zukauskas + fin enhancement':
@@ -1118,28 +1196,73 @@ for i, p in enumerate(pass_area_rows, start=1):
             G_air = kl['G_air']
             dp_air_pass = kl['dp_air_core_Pa']*k_DP
 
-        eta_f_row = fin_efficiency_rect(h_o, k_fin, fin_thk, 0.5*max(gap,1e-12))
-        A_eff_pass = p['A_tube_ext_pass_m2'] + joint_effectiveness*eta_f_row*p['A_fin_pass_m2']
-        R_air = 1.0/max(h_o,1e-12)
-        R_wall = tube_thk_mm/1000.0/max(k_tube,1e-12)
-        R_cool = 1.0/max(h_i,1e-12)
-        U_inv = R_air + R_wall + R_cool
-        U = (1.0/max(U_inv,1e-12))*k_UA
-        UA_pass = U*A_eff_pass
+        if tube_side_service == 'Charge air / CAC':
+            T_cool_pass_out = T_cool_pass_in - 1.0
+            P_pass_out_abs = max(P_pass_in_abs - 1000.0, 1000.0)
+            gas_mean = None
+            for _ in range(max(int(iters_per_row), 1)):
+                gas_mean = compressible_gas_tube_march(
+                    tube_props_at_pressure, T_cool_pass_in, T_cool_pass_out, P_pass_in_abs,
+                    m_dot_per_tube, Ai_flow_one, Dh_i, max(L_tube, 1e-12),
+                    internal_area_ratio=internal_area_ratio,
+                    internal_h_enhancement=internal_h_enhancement,
+                    internal_dp_multiplier=internal_dp_multiplier,
+                    n_segments=max(12, int(math.ceil(L_tube / 0.025)))
+                )
+                h_i = gas_mean['h_mean']
+                v_i = gas_mean['v_mean']
+                Re_i = gas_mean['Re_mean']
+                Nu_i = gas_mean['Nu_mean']
+                f_i = gas_mean['f_mean']
+                coolant_regime = gas_mean['regime']
+                dp_cool_pass = gas_mean['dp_total_Pa']
+                P_pass_out_abs = gas_mean['P_out_abs_Pa']
 
-        C_air = m_dot_air_pass*ap['cp']
-        C_cool = m_dot_cool*cp_c
-        C_min = min(C_air, C_cool)
-        C_max = max(C_air, C_cool)
-        Cr = C_min/max(C_max,1e-12)
-        NTU = UA_pass/max(C_min,1e-12)
-        eff = crossflow_mixed_unmixed_effectiveness(NTU, Cr)
-        Q_pass_W = eff*C_min*max(T_cool_pass_in - T_air_pass_in, 0.0)
-        T_cool_pass_out = T_cool_pass_in - Q_pass_W/max(C_cool,1e-12)
+                eta_f_row = fin_efficiency_rect(h_o, k_fin, fin_thk, 0.5*max(gap,1e-12))
+                A_eff_pass = p['A_tube_ext_pass_m2'] + joint_effectiveness*eta_f_row*p['A_fin_pass_m2']
+                R_air = 1.0/max(h_o,1e-12)
+                R_wall = tube_thk_mm/1000.0/max(k_tube,1e-12)
+                R_cool = 1.0/max(h_i,1e-12)
+                U_inv = R_air + R_wall + R_cool
+                U = (1.0/max(U_inv,1e-12))*k_UA
+                UA_pass = U*A_eff_pass
+
+                C_air = m_dot_air_pass*ap['cp']
+                C_cool = m_dot_cool*gas_mean['cp_mean']
+                C_min = min(C_air, C_cool)
+                C_max = max(C_air, C_cool)
+                Cr = C_min/max(C_max,1e-12)
+                NTU = UA_pass/max(C_min,1e-12)
+                eff = crossflow_mixed_unmixed_effectiveness(NTU, Cr)
+                Q_pass_W = eff*C_min*max(T_cool_pass_in - T_air_pass_in, 0.0)
+                T_cool_pass_out = T_cool_pass_in - Q_pass_W/max(C_cool,1e-12)
+            cp_c = gas_mean['cp_mean'] if gas_mean else cp_c
+        else:
+            eta_f_row = fin_efficiency_rect(h_o, k_fin, fin_thk, 0.5*max(gap,1e-12))
+            A_eff_pass = p['A_tube_ext_pass_m2'] + joint_effectiveness*eta_f_row*p['A_fin_pass_m2']
+            R_air = 1.0/max(h_o,1e-12)
+            R_wall = tube_thk_mm/1000.0/max(k_tube,1e-12)
+            R_cool = 1.0/max(h_i,1e-12)
+            U_inv = R_air + R_wall + R_cool
+            U = (1.0/max(U_inv,1e-12))*k_UA
+            UA_pass = U*A_eff_pass
+
+            C_air = m_dot_air_pass*ap['cp']
+            C_cool = m_dot_cool*cp_c
+            C_min = min(C_air, C_cool)
+            C_max = max(C_air, C_cool)
+            Cr = C_min/max(C_max,1e-12)
+            NTU = UA_pass/max(C_min,1e-12)
+            eff = crossflow_mixed_unmixed_effectiveness(NTU, Cr)
+            Q_pass_W = eff*C_min*max(T_cool_pass_in - T_air_pass_in, 0.0)
+            T_cool_pass_out = T_cool_pass_in - Q_pass_W/max(C_cool,1e-12)
+            P_pass_out_abs = max(P_pass_in_abs - dp_cool_pass, 1000.0)
+
         T_air_pass_out = T_air_pass_in + Q_pass_W/max(C_air,1e-12)
         T_air_out_overall_last_C = T_air_pass_out
         Q_total_W += Q_pass_W
         dp_air_total_Pa += dp_air_pass
+        dp_cool_total_Pa += max(P_pass_in_abs - P_pass_out_abs, 0.0)
 
         pass_summaries.append({
             'pass_num': i,
@@ -1166,7 +1289,9 @@ for i, p in enumerate(pass_area_rows, start=1):
             'A_min_pass_m2': A_min_pass,
             'G_air_pass_kg_m2s': G_air,
             'dp_air_pass_Pa': dp_air_pass,
-            'dp_cool_pass_kPa': dp_cool_pass/1000.0,
+            'dp_cool_pass_kPa': max(P_pass_in_abs - P_pass_out_abs, 0.0)/1000.0,
+            'P_tube_in_abs_kPa': P_pass_in_abs/1000.0,
+            'P_tube_out_abs_kPa': P_pass_out_abs/1000.0,
             'UA_pass_W_K': UA_pass,
             'eff_pass': eff,
             'surface_id': kl_surface_id if air_htc_model == 'Kays-London flat-tube surface' else None,
@@ -1227,6 +1352,7 @@ for i, p in enumerate(pass_area_rows, start=1):
         T_cool_row_in = T_cool_pass_in
         row_Tcool_out = []
         row_dp_cool = []
+        row_Ptube_out = []
         row_Re_i = []
         row_Nu_i = []
         row_h_i = []
@@ -1243,16 +1369,37 @@ for i, p in enumerate(pass_area_rows, start=1):
                 ap_r = air_properties(T_air_prop, RH_frac)
 
                 T_cool_prop = 0.5*(T_cool_row_in + T_cool_out_r) if var_props else T_cool_row_in
-                cpkg_r = tube_props_at(T_cool_prop)
-                rho_c_r = cpkg_r['rho']; mu_c_r = cpkg_r['mu']; k_c_r = cpkg_r['k']; Pr_c_r = cpkg_r['Pr']; cp_c_r = cpkg_r['cp']
                 m_dot_per_tube_r = m_dot_cool_row/max(tubes_per_row_local, 1)
-                v_i_r = m_dot_per_tube_r/max(rho_c_r*Ai_flow_one, 1e-12)
-                Re_i_r = reynolds(rho_c_r, v_i_r, Dh_i, mu_c_r)
-                Nu_i_r, coolant_regime_r = nu_internal_tube(Re_i_r, Pr_c_r, Dh_i, max(L_tube, 1e-12))
-                h_i_base_r = Nu_i_r*k_c_r/max(Dh_i,1e-12)
-                h_i_r = h_i_base_r*internal_area_ratio*internal_h_enhancement
-                f_i_r, friction_regime_r = f_internal_tube(Re_i_r)
-                dp_cool_row = f_i_r*(L_tube/max(Dh_i,1e-12))*0.5*rho_c_r*(v_i_r**2)*internal_dp_multiplier
+                if tube_side_service == 'Charge air / CAC':
+                    gas_row = compressible_gas_tube_march(
+                        tube_props_at_pressure, T_cool_row_in, T_cool_out_r, P_tube_pass_in_abs_Pa,
+                        m_dot_per_tube_r, Ai_flow_one, Dh_i, max(L_tube, 1e-12),
+                        internal_area_ratio=internal_area_ratio,
+                        internal_h_enhancement=internal_h_enhancement,
+                        internal_dp_multiplier=internal_dp_multiplier,
+                        n_segments=max(12, int(math.ceil(L_tube / 0.025)))
+                    )
+                    rho_c_r = gas_row['rho_mean']; mu_c_r = gas_row['mu_mean']; k_c_r = gas_row['k_mean']; cp_c_r = gas_row['cp_mean']
+                    Pr_c_r = cp_c_r*mu_c_r/max(k_c_r, 1e-12)
+                    v_i_r = gas_row['v_mean']
+                    Re_i_r = gas_row['Re_mean']
+                    Nu_i_r = gas_row['Nu_mean']
+                    coolant_regime_r = gas_row['regime']
+                    h_i_r = gas_row['h_mean']
+                    f_i_r = gas_row['f_mean']
+                    dp_cool_row = gas_row['dp_total_Pa']
+                    P_tube_row_out_abs = gas_row['P_out_abs_Pa']
+                else:
+                    cpkg_r = tube_props_at_pressure(T_cool_prop, P_tube_pass_in_abs_Pa)
+                    rho_c_r = cpkg_r['rho']; mu_c_r = cpkg_r['mu']; k_c_r = cpkg_r['k']; Pr_c_r = cpkg_r['Pr']; cp_c_r = cpkg_r['cp']
+                    v_i_r = m_dot_per_tube_r/max(rho_c_r*Ai_flow_one, 1e-12)
+                    Re_i_r = reynolds(rho_c_r, v_i_r, Dh_i, mu_c_r)
+                    Nu_i_r, coolant_regime_r = nu_internal_tube(Re_i_r, Pr_c_r, Dh_i, max(L_tube, 1e-12))
+                    h_i_base_r = Nu_i_r*k_c_r/max(Dh_i,1e-12)
+                    h_i_r = h_i_base_r*internal_area_ratio*internal_h_enhancement
+                    f_i_r, friction_regime_r = f_internal_tube(Re_i_r)
+                    dp_cool_row = f_i_r*(L_tube/max(Dh_i,1e-12))*0.5*rho_c_r*(v_i_r**2)*internal_dp_multiplier
+                    P_tube_row_out_abs = max(P_tube_pass_in_abs_Pa - dp_cool_row, 1000.0)
 
                 if air_htc_model == 'Zukauskas + fin enhancement':
                     Re_air_r = reynolds(ap_r['rho'], vmax_geom, max(od_d,1e-12), ap_r['mu'])
@@ -1370,13 +1517,17 @@ for i, p in enumerate(pass_area_rows, start=1):
                 'eps_row': eps_row,
                 'dp_air_row_Pa': dp_air_row,
                 'dp_cool_row_kPa': dp_cool_row/1000.0,
+                'P_tube_in_abs_kPa': P_tube_pass_in_abs_Pa/1000.0,
+                'P_tube_out_abs_kPa': P_tube_row_out_abs/1000.0,
                 'surface_id': kl_surface_id if air_htc_model == 'Kays-London flat-tube surface' else None,
             })
 
             T_air_in_r = T_air_out_r
+            row_Ptube_out.append(P_tube_row_out_abs)
 
         T_cool_pass_out = float(np.mean(row_Tcool_out)) if row_Tcool_out else T_cool_pass_in
-        dp_cool_pass = float(np.mean(row_dp_cool)) if row_dp_cool else 0.0
+        P_pass_out_abs = float(np.mean(row_Ptube_out)) if row_Ptube_out else P_tube_pass_in_abs_Pa
+        dp_cool_pass = max(P_tube_pass_in_abs_Pa - P_pass_out_abs, 0.0)
         dp_cool_total_Pa += dp_cool_pass
         T_air_pass_in = air_in_C
         T_air_pass_out = T_air_in_r
@@ -1385,7 +1536,7 @@ for i, p in enumerate(pass_area_rows, start=1):
         dp_air_total_Pa += dp_air_pass
 
         C_air_pass_in = m_dot_air_pass*ap_pass_in['cp']
-        pass_in_props = tube_props_at(T_cool_pass_in)
+        pass_in_props = tube_props_at_pressure(T_cool_pass_in, P_tube_pass_in_abs_Pa)
         C_cool_pass_in = m_dot_cool*pass_in_props['cp']
         eff_pass = Q_pass_W/max(min(C_air_pass_in, C_cool_pass_in)*max(T_cool_pass_in - air_in_C, 0.0), 1e-12)
 
@@ -1415,6 +1566,8 @@ for i, p in enumerate(pass_area_rows, start=1):
             'G_air_pass_kg_m2s': float(np.mean(row_G)) if row_G else float('nan'),
             'dp_air_pass_Pa': dp_air_pass,
             'dp_cool_pass_kPa': dp_cool_pass/1000.0,
+            'P_tube_in_abs_kPa': P_tube_pass_in_abs_Pa/1000.0,
+            'P_tube_out_abs_kPa': P_pass_out_abs/1000.0,
             'UA_pass_W_K': float(np.sum(row_UAs)),
             'eff_pass': eff_pass,
             'surface_id': kl_surface_id if air_htc_model == 'Kays-London flat-tube surface' else None,
@@ -1422,6 +1575,7 @@ for i, p in enumerate(pass_area_rows, start=1):
         })
 
     T_cool_pass_in = T_cool_pass_out
+    P_tube_pass_in_abs_Pa = P_pass_out_abs if 'P_pass_out_abs' in locals() else max(P_tube_pass_in_abs_Pa - dp_cool_pass, 1000.0)
 
 Q_achieved_kW = Q_total_W/1000.0
 T_cool_out_model_C = T_cool_pass_in
@@ -1597,7 +1751,7 @@ geom_rows = [
     {'Item':'Tube-side mass flow (kg/s)','Value':m_dot_cool},
     {'Item':'Oil nu@40C (cSt)','Value':oil_nu40_cSt if tube_side_service == 'Oil' else ''},
     {'Item':'Oil nu@100C (cSt)','Value':oil_nu100_cSt if tube_side_service == 'Oil' else ''},
-    {'Item':'Internal insert inside tube','Value':internal_fins_in_tube},
+    {'Item':'Internal insert inside tube','Value':internal_insert_present_display},
     {'Item':'Internal insert type','Value':internal_insert_type_resolved},
     {'Item':'Internal fin style','Value':internal_fin_style},
     {'Item':'Internal fin FPI','Value':internal_fin_fpi},
@@ -1777,7 +1931,7 @@ def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
     kv('Fin material', fin_material)
     kv('Resolved fin-to-tube joint type', resolved_joint_type_default)
     kv('Bond effectiveness', fmt(joint_effectiveness, 3))
-    kv('Internal insert present', 'Yes' if internal_fins_in_tube else 'No')
+    kv('Internal insert present', internal_insert_present_display)
     kv('Internal insert type', internal_insert_type_resolved)
     kv('Internal fin style', internal_fin_style)
     kv('Internal fin FPI', fmt(internal_fin_fpi, 2))
@@ -1821,7 +1975,7 @@ def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
         )
         wrapped(
             f"Re_air {float(r['Re_air_pass']):.0f} | h_air {float(r['h_o_pass_W_m2K']):.1f} W/m²K | ΔP_air {float(r['dp_air_pass_Pa']):.2f} Pa | "
-            f"ΔP_tube {float(r['dp_cool_pass_kPa']):.3f} kPa | Regime {r['coolant_regime_pass']}",
+            f"ΔP_tube {float(r['dp_cool_pass_kPa']):.3f} kPa | P_tube,abs {float(r.get('P_tube_in_abs_kPa', float('nan'))):.2f} → {float(r.get('P_tube_out_abs_kPa', float('nan'))):.2f} kPa | Regime {r['coolant_regime_pass']}",
             size=8.5, gap=4.2
         )
         line('', size=8, gap=1.5)
@@ -1837,7 +1991,7 @@ def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
         wrapped(
             f"{r['pass_row']}: Air {float(r['T_air_in_C']):.2f} → {float(r['T_air_out_C']):.2f} °C | "
             f"{tube_side_label} {float(r['T_cool_in_C']):.2f} → {float(r['T_cool_out_C']):.2f} °C | Q_row {float(r['Q_row_kW']):.3f} kW | "
-            f"Re_tube {float(r['Re_i']):.0f} | Nu_tube {float(r['Nu_i']):.2f} | ΔP_tube {float(r['dp_cool_row_kPa']):.3f} kPa | ΔP_air {float(r['dp_air_row_Pa']):.2f} Pa",
+            f"Re_tube {float(r['Re_i']):.0f} | Nu_tube {float(r['Nu_i']):.2f} | ΔP_tube {float(r['dp_cool_row_kPa']):.3f} kPa | P_tube,abs {float(r.get('P_tube_in_abs_kPa', float('nan'))):.2f} → {float(r.get('P_tube_out_abs_kPa', float('nan'))):.2f} kPa | ΔP_air {float(r['dp_air_row_Pa']):.2f} Pa",
             size=7.5, gap=3.4
         )
 
@@ -1848,7 +2002,8 @@ def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
         'Tube-side multipass logic: passes in series, tubes within each pass in parallel.',
         f'With row marching enabled, air is marched row by row and the {tube_side_label.lower()} branches in a pass are remixed at the outlet header.',
         'Tube-side in-tube correlation: laminar/developing below Re≈2300, Gnielinski above Re≈4000, with transition blending in between.',
-        'This report uses the current app friction and heat-transfer model exactly as executed for the case shown. For charge-air cases with very high predicted velocity or pressure drop, the result should be checked against compressible-flow reality and test data.'
+        'For charge-air service, the tube-side pressure drop is marched with local temperature, pressure, density, and velocity along the pass using a 1D compressible-gas approximation.',
+        'This report uses the current app friction and heat-transfer model exactly as executed for the case shown. Very aggressive charge-air insert geometries or extreme pressure ratios should still be checked against test data.'
     ]
     for m in methods:
         wrapped('• ' + m, size=8.5, gap=4.0)
@@ -1886,7 +2041,7 @@ summary_df = pd.DataFrame([{
     'T_air_out_model_C': round(T_air_out_model_C,3),
     'dp_air_total_Pa': round(dp_air_total_Pa,3),
     'dp_tube_total_kPa': round(dp_cool_total_Pa/1000.0,3),
-    'internal_fins_in_tube': internal_fins_in_tube,
+    'internal_fins_in_tube': internal_insert_present_display,
     'internal_fin_style': internal_fin_style,
     'internal_fin_fpi': internal_fin_fpi,
     'internal_fin_count_per_tube': int(internal_fin_count_per_tube),
