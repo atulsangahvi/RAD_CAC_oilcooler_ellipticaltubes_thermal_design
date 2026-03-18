@@ -785,7 +785,7 @@ with st.sidebar:
                                               help="In this mode the app derives the required heat rejection from the tube-side flow and target outlet temperature.")
 
     st.subheader("Coolant pass layout")
-    n_passes = st.number_input("Number of coolant passes", min_value=1, value=3, step=1)
+    n_passes = st.number_input("Number of passes for tube-side fluid", min_value=1, value=3, step=1)
     pass_mode = st.radio("Pass tube distribution mode", ["Equal tubes per pass", "Unequal pass widths"])
     total_tubes_per_row = count_tubes_per_row(core_width_mm, pitch_w_mm, od_w_mm)
 
@@ -2004,7 +2004,7 @@ def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
     kv('Pass layout', ', '.join([f"P{int(r['pass_num'])}: {float(r['pass_width_mm']):.1f} mm / {int(r['tubes_per_row_pass'])} tubes-row" for _, r in pass_df.iterrows()]))
 
     new_page('6. Pass summary')
-    wrapped('Each coolant / tube-side pass is shown below. For charge-air service, the pass labels still follow the tube-side path through the core.', size=8.5, gap=4.0)
+    wrapped('Each tube-side fluid pass is shown below. For charge-air service, the pass labels follow the tube-side flow path through the core. The reported pass outlet pressure is the remixed outlet-header pressure for that pass.', size=8.5, gap=4.0)
     for _, r in pass_df.iterrows():
         line(f"Pass P{int(r['pass_num'])}", size=9.5, bold=True, gap=4.5)
         wrapped(
@@ -2025,7 +2025,7 @@ def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
         line('', size=8, gap=1.5)
 
     new_page('7. Row-by-row appendix')
-    wrapped('This appendix shows the row-marching details. For parallel tube-side branches inside a pass, the same branch inlet temperature is shown for each row and the branch outlet temperature changes with local air heating.', size=8.5, gap=4.0)
+    wrapped('This appendix shows the row-marching details. Air is marched serially row by row. Inside each pass, the tube-side fluid is solved as parallel row branches fed from a common inlet header, so the same branch inlet pressure and temperature may appear on each row line within a pass. The listed row outlet pressure is that branch-row outlet estimate; it is not a serial row-to-row tube pressure march. The pass summary above reports the remixed outlet-header pressure for the full pass.', size=8.5, gap=4.0)
     current_pass = None
     for _, r in rows_df.iterrows():
         pass_no = int(r['pass_num'])
@@ -2035,7 +2035,7 @@ def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
         wrapped(
             f"{r['pass_row']}: Air {float(r['T_air_in_C']):.2f} → {float(r['T_air_out_C']):.2f} °C | "
             f"{tube_side_label} {float(r['T_cool_in_C']):.2f} → {float(r['T_cool_out_C']):.2f} °C | Q_row {float(r['Q_row_kW']):.3f} kW | "
-            f"Re_tube {float(r['Re_i']):.0f} | Nu_tube {float(r['Nu_i']):.2f} | ΔP_tube {float(r['dp_cool_row_kPa']):.3f} kPa | P_tube,abs {float(r.get('P_tube_in_abs_kPa', float('nan'))):.2f} → {float(r.get('P_tube_out_abs_kPa', float('nan'))):.2f} kPa | ΔP_air {float(r['dp_air_row_Pa']):.2f} Pa",
+            f"Re_tube {float(r['Re_i']):.0f} | Nu_tube {float(r['Nu_i']):.2f} | ΔP_tube,branch {float(r['dp_cool_row_kPa']):.3f} kPa | P_branch,abs common inlet → row outlet {float(r.get('P_tube_in_abs_kPa', float('nan'))):.2f} → {float(r.get('P_tube_out_abs_kPa', float('nan'))):.2f} kPa | ΔP_air,row {float(r['dp_air_row_Pa']):.2f} Pa",
             size=7.5, gap=3.4
         )
 
@@ -2044,7 +2044,7 @@ def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
         'Tube-side geometry uses a rounded-rectangle / obround tube model.',
         'Air-side total area = total exposed tube area + total net fin area. Effective area applies fin efficiency and bond effectiveness to the fin contribution.',
         'Tube-side multipass logic: passes in series, tubes within each pass in parallel.',
-        f'With row marching enabled, air is marched row by row and the {tube_side_label.lower()} branches in a pass are remixed at the outlet header.',
+        f'With row marching enabled, air is marched row by row and the {tube_side_label.lower()} branches in a pass are solved in parallel from a common inlet header and remixed at the outlet header.',
         'Tube-side in-tube correlation: laminar/developing below Re≈2300, Gnielinski above Re≈4000, with transition blending in between.',
         'For charge-air service, the tube-side pressure drop is marched with local temperature, pressure, density, and velocity along the pass using a 1D compressible-gas approximation.',
         'This report uses the current app friction and heat-transfer model exactly as executed for the case shown. Very aggressive charge-air insert geometries or extreme pressure ratios should still be checked against test data.'
