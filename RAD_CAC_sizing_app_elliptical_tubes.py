@@ -490,21 +490,32 @@ def f_internal_tube(Re):
 def compressible_gas_tube_march(props_func, T_in_C: float, T_out_C: float, P_in_abs_Pa: float,
                                  m_dot_per_tube: float, A_flow_one: float, Dh_i: float, L_tube: float,
                                  internal_area_ratio: float = 1.0, internal_h_enhancement: float = 1.0,
-                                 internal_dp_multiplier: float = 1.0, n_segments: int = 24) -> Dict[str, float]:
+                                 internal_dp_multiplier: float = 1.0, n_segments: int = 24,
+                                 P_min_abs_Pa: float = 101325.0) -> Dict[str, float]:
     """Segmented compressible-gas march along one tube.
     Uses local T/P-dependent density and viscosity, Darcy friction, and a simple acceleration term.
-    This is still a 1D engineering model, but it avoids the incompressible shortcut for CAC service.
+    The march is clipped at a physical minimum absolute pressure (ambient by default) so the solver
+    reports an infeasible / pressure-starved case instead of collapsing to absurd near-vacuum density.
     """
-    n_segments = max(int(n_segments), 4)
+    n_segments = max(int(n_segments), 8)
     dx = max(L_tube, 1e-12) / n_segments
-    P = max(P_in_abs_Pa, 2_000.0)
+    P_floor = max(float(P_min_abs_Pa), 5_000.0)
+    P = max(float(P_in_abs_Pa), P_floor + 100.0)
     G = m_dot_per_tube / max(A_flow_one, 1e-12)
+    R_gas = 287.05
 
     sum_rho = sum_cp = sum_k = sum_mu = 0.0
     sum_Re = sum_Nu = sum_h = sum_v = sum_f = 0.0
     last_regime = 'n/a'
+    mach_max = 0.0
+    hit_pressure_floor = False
+    segments_done = 0
 
     for s in range(n_segments):
+        if P <= P_floor + 1.0:
+            hit_pressure_floor = True
+            break
+
         x0 = s / n_segments
         x1 = (s + 1) / n_segments
         T0 = T_in_C + (T_out_C - T_in_C) * x0
@@ -512,25 +523,38 @@ def compressible_gas_tube_march(props_func, T_in_C: float, T_out_C: float, P_in_
         Tm = 0.5 * (T0 + T1)
 
         props = props_func(Tm, P)
-        rho = max(float(props['rho']), 1e-9)
-        cp = max(float(props['cp']), 1e-9)
+        rho = max(float(props['rho']), 1e-6)
+        cp = max(float(props['cp']), 1e-6)
         k = max(float(props['k']), 1e-12)
         mu = max(float(props['mu']), 1e-12)
         Pr = max(float(props['Pr']), 1e-12)
 
         v = m_dot_per_tube / max(rho * A_flow_one, 1e-12)
+        gamma = min(max(cp / max(cp - R_gas, 1.0), 1.05), 1.67)
+        a = math.sqrt(max(gamma * R_gas * (Tm + 273.15), 1e-9))
+        mach = v / max(a, 1e-12)
+        mach_max = max(mach_max, mach)
+
         Re = reynolds(rho, v, Dh_i, mu)
         Nu, regime = nu_internal_tube(Re, Pr, Dh_i, max(L_tube, 1e-12))
         h = (Nu * k / max(Dh_i, 1e-12)) * internal_area_ratio * internal_h_enhancement
         fDarcy, _ = f_internal_tube(Re)
 
         dP_f = fDarcy * (dx / max(Dh_i, 1e-12)) * 0.5 * rho * (v ** 2) * internal_dp_multiplier
-        P_after_f = max(P - dP_f, 1_000.0)
-        props_out = props_func(T1, P_after_f)
-        rho_out = max(float(props_out['rho']), 1e-9)
+        P_guess = max(P - dP_f, P_floor)
+        props_out = props_func(T1, P_guess)
+        rho_out = max(float(props_out['rho']), 1e-6)
         dP_acc = max((G ** 2) * (1.0 / rho_out - 1.0 / rho), 0.0)
-        dP_seg = dP_f + dP_acc
-        P = max(P - dP_seg, 1_000.0)
+        dP_seg_raw = dP_f + dP_acc
+        dP_allow = max(P - P_floor, 0.0)
+        if dP_seg_raw >= dP_allow:
+            dP_seg = dP_allow
+            P = P_floor
+            hit_pressure_floor = True
+        else:
+            # keep the explicit march numerically stable even in aggressive CAC cases
+            dP_seg = min(dP_seg_raw, 0.35 * max(P - P_floor, 0.0))
+            P = max(P - dP_seg, P_floor)
 
         sum_rho += rho
         sum_cp += cp
@@ -542,8 +566,12 @@ def compressible_gas_tube_march(props_func, T_in_C: float, T_out_C: float, P_in_
         sum_v += v
         sum_f += fDarcy
         last_regime = regime
+        segments_done += 1
 
-    denom = float(n_segments)
+        if hit_pressure_floor:
+            break
+
+    denom = float(max(segments_done, 1))
     return {
         'dp_total_Pa': max(P_in_abs_Pa - P, 0.0),
         'P_out_abs_Pa': P,
@@ -557,6 +585,9 @@ def compressible_gas_tube_march(props_func, T_in_C: float, T_out_C: float, P_in_
         'v_mean': sum_v / denom,
         'f_mean': sum_f / denom,
         'regime': last_regime,
+        'mach_max': mach_max,
+        'hit_pressure_floor': hit_pressure_floor,
+        'segments_done': segments_done,
     }
 
 def colburn_j_corrugated(Re, fin_pitch, Dh_air, pitch_l, pitch_w, louver_pitch=0.0, louver_angle_deg=0.0,
@@ -1121,6 +1152,9 @@ dp_air_total_Pa = 0.0
 dp_cool_total_Pa = 0.0
 T_cool_pass_in = T_cool_in_C
 P_tube_pass_in_abs_Pa = coolant_pressure_abs_kPa*1000.0
+charge_air_pressure_floor_abs_Pa = 101325.0 if tube_side_service == 'Charge air / CAC' else 1000.0
+gas_pressure_floor_hit_any = False
+gas_mach_max_overall = 0.0
 T_air_out_overall_last_C = air_in_C
 
 for i, p in enumerate(pass_area_rows, start=1):
@@ -1207,8 +1241,11 @@ for i, p in enumerate(pass_area_rows, start=1):
                     internal_area_ratio=internal_area_ratio,
                     internal_h_enhancement=internal_h_enhancement,
                     internal_dp_multiplier=internal_dp_multiplier,
-                    n_segments=max(12, int(math.ceil(L_tube / 0.025)))
+                    n_segments=max(20, int(math.ceil(L_tube / 0.02))),
+                    P_min_abs_Pa=charge_air_pressure_floor_abs_Pa,
                 )
+                gas_pressure_floor_hit_any = gas_pressure_floor_hit_any or bool(gas_mean.get('hit_pressure_floor', False))
+                gas_mach_max_overall = max(gas_mach_max_overall, float(gas_mean.get('mach_max', 0.0)))
                 h_i = gas_mean['h_mean']
                 v_i = gas_mean['v_mean']
                 Re_i = gas_mean['Re_mean']
@@ -1377,8 +1414,11 @@ for i, p in enumerate(pass_area_rows, start=1):
                         internal_area_ratio=internal_area_ratio,
                         internal_h_enhancement=internal_h_enhancement,
                         internal_dp_multiplier=internal_dp_multiplier,
-                        n_segments=max(12, int(math.ceil(L_tube / 0.025)))
+                        n_segments=max(20, int(math.ceil(L_tube / 0.02))),
+                        P_min_abs_Pa=charge_air_pressure_floor_abs_Pa,
                     )
+                    gas_pressure_floor_hit_any = gas_pressure_floor_hit_any or bool(gas_row.get('hit_pressure_floor', False))
+                    gas_mach_max_overall = max(gas_mach_max_overall, float(gas_row.get('mach_max', 0.0)))
                     rho_c_r = gas_row['rho_mean']; mu_c_r = gas_row['mu_mean']; k_c_r = gas_row['k_mean']; cp_c_r = gas_row['cp_mean']
                     Pr_c_r = cp_c_r*mu_c_r/max(k_c_r, 1e-12)
                     v_i_r = gas_row['v_mean']
@@ -1590,12 +1630,16 @@ tube_dp_total_kPa = dp_cool_total_Pa/1000.0
 first_pass = pass_summaries[0] if pass_summaries else {}
 first_pass_v_i = float(first_pass.get('v_i_pass_m_s', float('nan'))) if first_pass else float('nan')
 if tube_side_service == 'Charge air / CAC':
+    if gas_pressure_floor_hit_any:
+        report_warnings.append(f'Charge-air pressure march hit the minimum allowed absolute pressure floor of {charge_air_pressure_floor_abs_Pa/1000.0:.1f} kPa (ambient default). For the entered mass flow and geometry, the case is pressure-limited / infeasible unless a lower outlet back-pressure is explicitly intended.')
     if tube_dp_total_kPa >= coolant_pressure_abs_kPa:
         report_warnings.append(f'Nonphysical tube-side pressure drop: predicted ΔP_tube = {tube_dp_total_kPa:.1f} kPa exceeds tube absolute inlet pressure = {coolant_pressure_abs_kPa:.1f} kPa. Review charge-air friction model, internal insert assumptions, or input flow/geometry.')
     elif tube_dp_total_kPa >= 0.5*coolant_pressure_abs_kPa:
         report_warnings.append(f'Very high charge-air pressure drop: predicted ΔP_tube = {tube_dp_total_kPa:.1f} kPa is more than 50% of the absolute inlet pressure = {coolant_pressure_abs_kPa:.1f} kPa.')
     if np.isfinite(first_pass_v_i) and first_pass_v_i > 100.0:
         report_warnings.append(f'Very high tube-side gas velocity: pass-1 velocity = {first_pass_v_i:.1f} m/s. Compressibility and insert-loss assumptions should be reviewed carefully.')
+    if gas_mach_max_overall >= 0.8:
+        report_warnings.append(f'Charge-air tube-side flow reaches high Mach number (max ≈ {gas_mach_max_overall:.2f}). The 1D model should be treated as screening-level only in this regime.')
 if Q_required_kW > Q_theoretical_max_kW + 1e-9:
     report_warnings.append(f'Required duty ({Q_required_kW:.2f} kW) exceeds the ideal inlet thermal limit ({Q_theoretical_max_kW:.2f} kW) for the current inlet conditions.')
 
@@ -2041,6 +2085,7 @@ summary_df = pd.DataFrame([{
     'T_air_out_model_C': round(T_air_out_model_C,3),
     'dp_air_total_Pa': round(dp_air_total_Pa,3),
     'dp_tube_total_kPa': round(dp_cool_total_Pa/1000.0,3),
+    'tube_side_max_mach': round(gas_mach_max_overall,3) if tube_side_service == 'Charge air / CAC' else None,
     'internal_fins_in_tube': internal_insert_present_display,
     'internal_fin_style': internal_fin_style,
     'internal_fin_fpi': internal_fin_fpi,
