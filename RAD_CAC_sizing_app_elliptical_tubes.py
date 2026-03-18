@@ -1431,8 +1431,21 @@ duty_balance_label = 'Duty excess (kW)' if duty_gap_kW >= 0 else 'Duty shortfall
 duty_balance_value_kW = abs(duty_gap_kW)
 overall_effectiveness_vs_inlet_limit = Q_achieved_kW/max(Q_theoretical_max_kW, 1e-12) if Q_theoretical_max_kW > 0 else float('nan')
 
-# -------------------- Results --------------------
+report_warnings = []
+tube_dp_total_kPa = dp_cool_total_Pa/1000.0
 first_pass = pass_summaries[0] if pass_summaries else {}
+first_pass_v_i = float(first_pass.get('v_i_pass_m_s', float('nan'))) if first_pass else float('nan')
+if tube_side_service == 'Charge air / CAC':
+    if tube_dp_total_kPa >= coolant_pressure_abs_kPa:
+        report_warnings.append(f'Nonphysical tube-side pressure drop: predicted ΔP_tube = {tube_dp_total_kPa:.1f} kPa exceeds tube absolute inlet pressure = {coolant_pressure_abs_kPa:.1f} kPa. Review charge-air friction model, internal insert assumptions, or input flow/geometry.')
+    elif tube_dp_total_kPa >= 0.5*coolant_pressure_abs_kPa:
+        report_warnings.append(f'Very high charge-air pressure drop: predicted ΔP_tube = {tube_dp_total_kPa:.1f} kPa is more than 50% of the absolute inlet pressure = {coolant_pressure_abs_kPa:.1f} kPa.')
+    if np.isfinite(first_pass_v_i) and first_pass_v_i > 100.0:
+        report_warnings.append(f'Very high tube-side gas velocity: pass-1 velocity = {first_pass_v_i:.1f} m/s. Compressibility and insert-loss assumptions should be reviewed carefully.')
+if Q_required_kW > Q_theoretical_max_kW + 1e-9:
+    report_warnings.append(f'Required duty ({Q_required_kW:.2f} kW) exceeds the ideal inlet thermal limit ({Q_theoretical_max_kW:.2f} kW) for the current inlet conditions.')
+
+# -------------------- Results --------------------
 col1, col2, col3, col4 = st.columns(4)
 col1.metric('Q achieved (kW)', f'{Q_achieved_kW:.2f}', delta=f'{duty_balance_value_kW:.2f} {"excess" if duty_gap_kW >= 0 else "shortfall"}')
 col2.metric('Required heat rejection (kW)', f'{Q_required_kW:.2f}')
@@ -1528,6 +1541,10 @@ elif limiting_side == 'Air side':
     st.info(f"Current inlet capacity rates show the air side is limiting (C_air={C_air_inlet_W_K:.1f} W/K, C_tube={C_cool_inlet_W_K:.1f} W/K). Increasing air flow usually helps more than increasing the tube-side flow from this point.")
 else:
     st.info(f"Current inlet capacity rates show the {tube_side_label.lower()} side is limiting (C_air={C_air_inlet_W_K:.1f} W/K, C_tube={C_cool_inlet_W_K:.1f} W/K). Increasing the tube-side flow or tube-side heat capacity rate usually helps more than increasing air flow from this point.")
+
+if report_warnings:
+    for warn in report_warnings:
+        st.warning(warn)
 
 st.markdown('---')
 st.subheader('Pass layout')
@@ -1635,89 +1652,207 @@ else:
 
 # -------------------- Downloads --------------------
 def make_pdf_report_bytes(summary_df, pass_df, rows_df, geom_rows):
-    buf = io.BytesIO()
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas
+    from reportlab.lib import colors
+
+    tube_temp_label = f"{tube_side_label} temperature"
+    tube_dp_label = f"{tube_side_label} ΔP"
+
+    def fmt(v, nd=3):
+        if v is None or v == '' or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+            return '—'
+        if isinstance(v, (int, np.integer)):
+            return str(int(v))
+        if isinstance(v, (float, np.floating)):
+            return f"{float(v):.{nd}f}"
+        return str(v)
+
+    def grouped_geom_dict(rows):
+        return {str(r['Item']): r['Value'] for r in rows}
+
+    gd = grouped_geom_dict(geom_rows)
+    buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
-    y = H - 20*mm
+    left = 14*mm
+    right = W - 14*mm
+    y = H - 16*mm
 
-    def line(txt, dy=6):
+    def new_page(title=None):
         nonlocal y
-        c.drawString(12*mm, y, txt)
-        y -= dy*mm
-        if y < 15*mm:
-            c.showPage(); y = H - 20*mm
+        c.showPage()
+        y = H - 16*mm
+        if title:
+            section_title(title)
 
-    c.setFont('Helvetica-Bold', 14)
-    line('Radiator Thermal Report', dy=8)
-    c.setFont('Helvetica', 8)
-    line(datetime.now().strftime('%Y-%m-%d %H:%M:%S'), dy=6)
-    line('')
-    c.setFont('Helvetica-Bold', 11)
-    line('Summary', dy=7)
-    c.setFont('Helvetica', 8)
-    for _, r in summary_df.iterrows():
-        for k,v in r.items():
-            line(f'{k}: {v}', dy=5)
-    line('')
-    c.setFont('Helvetica-Bold', 11)
-    line('Air-side area summary', dy=7)
-    c.setFont('Helvetica', 8)
-    area_lines = [
-        f'Total tube area, air side (m2): {A_tube_airside_total_m2}',
-        f'Total net fin area, air side (m2): {A_fin_net_airside_total_m2}',
-        f'Total heat transfer area, air side (m2): {A_airside_total_geom_m2}',
-        f'Effective area eta_f-weighted (m2): {A_airside_effective_m2}',
-        f'Fin efficiency eta_f (-): {eta_fin}',
-    ]
-    for txt in area_lines:
-        line(txt, dy=5)
-    line('')
-    c.setFont('Helvetica-Bold', 11)
-    line('Tube and fin count summary', dy=7)
-    c.setFont('Helvetica', 8)
-    count_lines = [
-        f'Tubes per row: {int(total_tubes_per_row)}',
-        f'Total tubes: {int(total_tubes)}',
-        f'One fin gross area, air side both faces (m2): {one_fin_area_gross_airside_both_faces_m2}',
-        f'One fin net area, air side both faces (m2): {one_fin_area_airside_both_faces_m2}',
-        f'Total number of fins: {int(N_fins_total)}',
-    ]
-    for txt in count_lines:
-        line(txt, dy=5)
-    line('')
-    c.setFont('Helvetica-Bold', 11)
-    line('Geometry / intermediate values', dy=7)
-    c.setFont('Helvetica', 8)
-    for rr in geom_rows:
-        line(f"{rr['Item']}: {rr['Value']}", dy=5)
-    c.showPage(); y = H - 20*mm
-    c.setFont('Helvetica-Bold', 11)
-    line(f'{tube_side_label} pass summary', dy=7)
-    c.setFont('Helvetica', 7)
+    def line(txt='', size=9, bold=False, gap=4.5, color=colors.black):
+        nonlocal y
+        if y < 16*mm:
+            new_page()
+        c.setFillColor(color)
+        c.setFont('Helvetica-Bold' if bold else 'Helvetica', size)
+        c.drawString(left, y, str(txt))
+        y -= gap*mm
+        c.setFillColor(colors.black)
+
+    def wrapped(txt, size=9, bold=False, gap=4.3):
+        nonlocal y
+        c.setFont('Helvetica-Bold' if bold else 'Helvetica', size)
+        max_chars = 115 if size >= 9 else 135
+        words = str(txt).split()
+        cur = ''
+        for w in words:
+            test = (cur + ' ' + w).strip()
+            if len(test) <= max_chars:
+                cur = test
+            else:
+                line(cur, size=size, bold=bold, gap=gap)
+                cur = w
+        if cur:
+            line(cur, size=size, bold=bold, gap=gap)
+
+    def section_title(txt):
+        line(txt, size=11, bold=True, gap=5.5)
+        c.setStrokeColor(colors.HexColor('#888888'))
+        c.line(left, y+1.5*mm, right, y+1.5*mm)
+        c.setStrokeColor(colors.black)
+        y_shift = 2.5
+        nonlocal_y = None
+        # use closure variable directly
+        globals()
+
+    def kv(label, value, units=''):
+        suffix = f' {units}' if units else ''
+        wrapped(f'{label}: {value}{suffix}', size=9, gap=4.0)
+
+    # Title
+    line('Radiator / CAC / Oil Cooler Thermal Report', size=14, bold=True, gap=5.2)
+    line(datetime.now().strftime('%Y-%m-%d %H:%M:%S'), size=8, gap=4.5)
+
+    # Executive summary
+    section_title('1. Executive summary')
+    kv('Thermal mode', thermal_mode)
+    kv('Tube-side service', tube_side_label)
+    kv('Required duty', fmt(Q_required_kW, 2), 'kW')
+    kv('Achieved duty', fmt(Q_achieved_kW, 2), 'kW')
+    kv(duty_balance_label, fmt(duty_balance_value_kW, 2), 'kW')
+    kv('Tube-side inlet temperature', fmt(T_cool_in_C, 2), '°C')
+    kv('Tube-side target outlet temperature', fmt(T_cool_out_target_C, 2), '°C')
+    kv('Tube-side model outlet temperature', fmt(T_cool_out_model_C, 2), '°C')
+    kv('Air inlet temperature', fmt(air_in_C, 2), '°C')
+    kv('Air model outlet temperature', fmt(T_air_out_model_C, 2), '°C')
+    kv('Air total pressure drop', fmt(dp_air_total_Pa, 1), 'Pa')
+    kv(f'{tube_side_label} total pressure drop', fmt(tube_dp_total_kPa, 3), 'kPa')
+    if tube_side_service in ['Charge air / CAC', 'Oil']:
+        kv('Tube-side inlet pressure, gauge', fmt(coolant_pressure_g_kPa, 3), 'kPa')
+        kv('Tube-side inlet pressure, absolute', fmt(coolant_pressure_abs_kPa, 3), 'kPa')
+
+    section_title('2. Warnings / sanity checks')
+    if report_warnings:
+        for w in report_warnings:
+            wrapped('• ' + w, size=9, gap=4.0)
+    else:
+        wrapped('No immediate report sanity flags were triggered for this case.', size=9, gap=4.0)
+
+    section_title('3. Geometry, counts, areas')
+    kv('Core width', fmt(core_width_mm, 1), 'mm')
+    kv('Core height', fmt(core_height_mm, 1), 'mm')
+    kv('Core depth', fmt(core_depth_mm, 1), 'mm')
+    kv('Tubes per row', int(total_tubes_per_row))
+    kv('Total tubes', int(total_tubes))
+    kv('Total number of fins', int(N_fins_total))
+    kv('One fin gross area, both faces', fmt(one_fin_area_gross_airside_both_faces_m2, 6), 'm²')
+    kv('One fin net area, both faces', fmt(one_fin_area_airside_both_faces_m2, 6), 'm²')
+    kv('Total tube area, air side', fmt(A_tube_airside_total_m2, 3), 'm²')
+    kv('Total net fin area, air side', fmt(A_fin_net_airside_total_m2, 3), 'm²')
+    kv('Total geometric heat-transfer area, air side', fmt(A_airside_total_geom_m2, 3), 'm²')
+    kv('Effective air-side area, ηf-weighted', fmt(A_airside_effective_m2, 3), 'm²')
+    kv('Fin efficiency ηf', fmt(eta_fin, 6))
+
+    section_title('4. Materials, joint, and tube-side insert')
+    kv('Tube material', tube_material)
+    kv('Fin material', fin_material)
+    kv('Resolved fin-to-tube joint type', resolved_joint_type_default)
+    kv('Bond effectiveness', fmt(joint_effectiveness, 3))
+    kv('Internal insert present', 'Yes' if internal_fins_in_tube else 'No')
+    kv('Internal insert type', internal_insert_type_resolved)
+    kv('Internal fin style', internal_fin_style)
+    kv('Internal fin FPI', fmt(internal_fin_fpi, 2))
+    kv('Internal insert count per tube', int(internal_fin_count_per_tube))
+    kv('Effective internal flow area per tube', fmt(Ai_flow_one*1e6, 3), 'mm²')
+    kv('Effective internal hydraulic diameter', fmt(Dh_i*1000.0, 3), 'mm')
+    kv('Internal equivalent area ratio', fmt(internal_area_ratio, 3))
+    kv('Internal HTC multiplier', fmt(internal_h_enhancement, 3))
+    kv('Internal ΔP multiplier', fmt(internal_dp_multiplier, 3))
+    if tube_side_service == 'Oil':
+        kv('Oil family', oil_family)
+        kv('Oil grade', oil_grade)
+        kv('Oil property model', 'Temperature-dependent grade library' if oil_use_grade_library else 'Manual constants / override')
+        kv('Oil ν@40°C', fmt(oil_nu40_cSt, 3), 'cSt')
+        kv('Oil ν@100°C', fmt(oil_nu100_cSt, 3), 'cSt')
+
+    new_page('5. Capacity guidance')
+    kv('Air thermal capacity rate C_air', fmt(C_air_inlet_W_K, 1), 'W/K')
+    kv(f'{tube_side_label} thermal capacity rate C_tube', fmt(C_cool_inlet_W_K, 1), 'W/K')
+    kv('Capacity ratio C_min / C_max', fmt(Cr_inlet, 4))
+    kv('Limiting side', limiting_side)
+    kv('Ideal inlet thermal limit Qmax', fmt(Q_theoretical_max_kW, 3), 'kW')
+    kv('Overall effectiveness vs inlet limit', fmt(overall_effectiveness_vs_inlet_limit, 6))
+    kv('Ideal air mass flow for required duty', fmt(m_dot_air_req_ideal, 3), 'kg/s')
+    kv('Ideal face velocity for required duty', fmt(face_velocity_req_ideal, 3), 'm/s')
+    kv('Pass layout', ', '.join([f"P{int(r['pass_num'])}: {float(r['pass_width_mm']):.1f} mm / {int(r['tubes_per_row_pass'])} tubes-row" for _, r in pass_df.iterrows()]))
+
+    new_page('6. Pass summary')
+    wrapped('Each coolant / tube-side pass is shown below. For charge-air service, the pass labels still follow the tube-side path through the core.', size=8.5, gap=4.0)
     for _, r in pass_df.iterrows():
-        line(' | '.join([f'{k}={r[k]}' for k in pass_df.columns]), dy=4)
-    c.showPage(); y = H - 20*mm
-    c.setFont('Helvetica-Bold', 11)
-    line('Row-by-row intermediate results', dy=7)
-    c.setFont('Helvetica', 6)
+        line(f"Pass P{int(r['pass_num'])}", size=9.5, bold=True, gap=4.5)
+        wrapped(
+            f"Width {float(r['pass_width_mm']):.1f} mm | Tubes/row {int(r['tubes_per_row_pass'])} | Total tubes {int(r['tubes_total_pass'])} | "
+            f"{tube_side_label} {float(r['T_cool_in_C']):.2f} → {float(r['T_cool_out_C']):.2f} °C | Air {float(r['T_air_in_C']):.2f} → {float(r['T_air_out_C']):.2f} °C",
+            size=8.5, gap=3.7
+        )
+        wrapped(
+            f"Q_pass {float(r['Q_pass_kW']):.3f} kW | UA {float(r['UA_pass_W_K']):.1f} W/K | ε {float(r['eff_pass']):.4f} | "
+            f"v_tube {float(r['v_i_pass_m_s']):.3f} m/s | Re_tube {float(r['Re_i_pass']):.0f} | Nu_tube {float(r['Nu_i_pass']):.2f} | h_tube {float(r['h_i_pass_W_m2K']):.1f} W/m²K",
+            size=8.5, gap=3.7
+        )
+        wrapped(
+            f"Re_air {float(r['Re_air_pass']):.0f} | h_air {float(r['h_o_pass_W_m2K']):.1f} W/m²K | ΔP_air {float(r['dp_air_pass_Pa']):.2f} Pa | "
+            f"ΔP_tube {float(r['dp_cool_pass_kPa']):.3f} kPa | Regime {r['coolant_regime_pass']}",
+            size=8.5, gap=4.2
+        )
+        line('', size=8, gap=1.5)
+
+    new_page('7. Row-by-row appendix')
+    wrapped('This appendix shows the row-marching details. For parallel tube-side branches inside a pass, the same branch inlet temperature is shown for each row and the branch outlet temperature changes with local air heating.', size=8.5, gap=4.0)
+    current_pass = None
     for _, r in rows_df.iterrows():
-        line(' | '.join([f'{k}={r[k]}' for k in rows_df.columns]), dy=3.8)
-    c.showPage(); y = H - 20*mm
-    c.setFont('Helvetica-Bold', 11)
-    line('Methods / assumptions', dy=7)
-    c.setFont('Helvetica', 8)
+        pass_no = int(r['pass_num'])
+        if current_pass != pass_no:
+            current_pass = pass_no
+            line(f'Pass P{pass_no}', size=9, bold=True, gap=4.2)
+        wrapped(
+            f"{r['pass_row']}: Air {float(r['T_air_in_C']):.2f} → {float(r['T_air_out_C']):.2f} °C | "
+            f"{tube_side_label} {float(r['T_cool_in_C']):.2f} → {float(r['T_cool_out_C']):.2f} °C | Q_row {float(r['Q_row_kW']):.3f} kW | "
+            f"Re_tube {float(r['Re_i']):.0f} | Nu_tube {float(r['Nu_i']):.2f} | ΔP_tube {float(r['dp_cool_row_kPa']):.3f} kPa | ΔP_air {float(r['dp_air_row_Pa']):.2f} Pa",
+            size=7.5, gap=3.4
+        )
+
+    new_page('8. Methods / assumptions')
     methods = [
-        'Air-side model options: Zukauskas + enhancement, generic Colburn-j template, or Kays-London flat-tube surface.',
-        'Password gate reads APP_PASSWORD from Streamlit secrets or environment.',
-        'Rounded-rectangle / obround tube area and hydraulic diameter are used for the tube-side flow path.',
-        'Plate-fin area uses net area correction with tube-hole subtraction; fin count is based on the core-height / fin-stacking dimension, and one-fin gross/net areas are shown explicitly on the UI and PDF.',
+        'Tube-side geometry uses a rounded-rectangle / obround tube model.',
+        'Air-side total area = total exposed tube area + total net fin area. Effective area applies fin efficiency and bond effectiveness to the fin contribution.',
         'Tube-side multipass logic: passes in series, tubes within each pass in parallel.',
-        f'With row-by-row mode ON, air is marched sequentially through rows and {tube_side_label.lower()} is split in parallel across rows within a pass, then remixed at the outlet header.',
-        f'Thermal-capacity guidance shows C_air = m_dot_air*cp_air and C_tube = m_dot_tube*cp_tube at inlet, plus the ideal inlet-limit Qmax = Cmin*(T_hot_in - T_cold_in). Tube material = {tube_material}; fin material = {fin_material}; resolved joint type = {resolved_joint_type_default}; bond effectiveness factor = {joint_effectiveness:.2f}.',
-        f'With row-by-row mode ON, tube-side properties are also re-evaluated row-by-row using the local branch mean temperature; for oil mode the selected grade library or manual oil inputs drive rho, mu, cp and k versus temperature.',
+        f'With row marching enabled, air is marched row by row and the {tube_side_label.lower()} branches in a pass are remixed at the outlet header.',
+        'Tube-side in-tube correlation: laminar/developing below Re≈2300, Gnielinski above Re≈4000, with transition blending in between.',
+        'This report uses the current app friction and heat-transfer model exactly as executed for the case shown. For charge-air cases with very high predicted velocity or pressure drop, the result should be checked against compressible-flow reality and test data.'
     ]
     for m in methods:
-        line(m, dy=5)
+        wrapped('• ' + m, size=8.5, gap=4.0)
+
     c.save()
     buf.seek(0)
     return buf.getvalue()
@@ -1729,6 +1864,7 @@ summary_df = pd.DataFrame([{
     'duty_balance_label': duty_balance_label,
     'duty_balance_kW': round(duty_balance_value_kW,3),
     'tube_side_service': tube_side_label,
+    'report_warnings': ' | '.join(report_warnings),
     'tube_material': tube_material,
     'fin_material': fin_material,
     'oil_family': oil_family if tube_side_service == 'Oil' else '',
@@ -1740,8 +1876,8 @@ summary_df = pd.DataFrame([{
     'T_air_in_C': air_in_C,
     'tube_pressure_g_kPa': coolant_pressure_g_kPa,
     'tube_pressure_abs_kPa': coolant_pressure_abs_kPa,
-    'oil_nu40_cSt': round(oil_nu40_cSt,3) if tube_side_service == 'Oil' else None,
-    'oil_nu100_cSt': round(oil_nu100_cSt,3) if tube_side_service == 'Oil' else None,
+    'oil_nu40_cSt': round(oil_nu40_cSt,3) if tube_side_service == 'Oil' else '',
+    'oil_nu100_cSt': round(oil_nu100_cSt,3) if tube_side_service == 'Oil' else '',
     'resolved_joint_type': resolved_joint_type_default,
     'bond_effectiveness': round(joint_effectiveness,4),
     'internal_insert_type': internal_insert_type_resolved,
@@ -1767,7 +1903,7 @@ summary_df = pd.DataFrame([{
     'A_airside_effective_m2': round(A_airside_effective_m2,3),
     'eta_fin': round(eta_fin,6),
     'C_air_inlet_W_K': round(C_air_inlet_W_K,3),
-    'C_cool_inlet_W_K': round(C_cool_inlet_W_K,3),
+    'C_tube_inlet_W_K': round(C_cool_inlet_W_K,3),
     'C_ratio_min_max': round(Cr_inlet,6),
     'limiting_side': limiting_side,
     'Qmax_inlet_kW': round(Q_theoretical_max_kW,3),
